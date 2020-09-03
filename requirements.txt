@@ -1,0 +1,6 @@
+cmake
+dlib
+numpy
+opencv-python
+matplotlib
+ffmpeg-python
