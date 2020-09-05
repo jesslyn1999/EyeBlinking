@@ -4,6 +4,7 @@ import json
 import shlex
 import os
 import time
+import ray
 
 
 def euclidean_distance(leftx, lefty, rightx, righty):

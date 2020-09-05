@@ -1,23 +1,20 @@
 import cv2
 import dlib
 import sys
+import math
 from util import *
 from Logger import Logger
 import argparse
 from pathlib import Path
 from graph import save_ear_graph, save_microsleep_perclos_graph
 import json
-from multiprocessing import Process, Value, Pool
 
 
-video_work_queue = []
+# import ray
+
 
 detector = dlib.get_frontal_face_detector()
 predictor = dlib.shape_predictor("model/shape_predictor_68_face_landmarks.dat")
-
-out_processed_results = []
-
-global_idx_video_out = 0
 
 total_input_videos = 0
 left_processed_videos = 0
@@ -26,76 +23,91 @@ file_stdout = sys.stdout
 original_stdout = sys.stdout
 
 
-def get_ear(eye_points, facial_landmarks):
+def image_resize(image, width=None, height=None, inter=cv2.INTER_AREA):
+    (h, w) = image.shape[:2]
+
+    if width is None and height is None:
+        return image
+
+    if width is None:
+        r = height / float(h)
+        dim = (int(w * r), height)
+    else:
+        r = width / float(w)
+        dim = (width, int(h * r))
+
+    dim = (640, 480)
+    return cv2.resize(image, dim, interpolation=inter)
+
+
+def get_ear(frame, eye_points, facial_landmarks):
     left_point = [facial_landmarks.part(eye_points[0]).x, facial_landmarks.part(eye_points[0]).y]
     right_point = [facial_landmarks.part(eye_points[3]).x, facial_landmarks.part(eye_points[3]).y]
     center_top = midpoint(facial_landmarks.part(eye_points[1]), facial_landmarks.part(eye_points[2]))
     center_bottom = midpoint(facial_landmarks.part(eye_points[5]), facial_landmarks.part(eye_points[4]))
+
+    # Drawing horizontal and vertical line
+    hor_line = cv2.line(frame, (left_point[0], left_point[1]), (right_point[0], right_point[1]), (255, 0, 0), 3)
+    ver_line = cv2.line(frame, (center_top[0], center_top[1]), (center_bottom[0], center_bottom[1]), (255, 0, 0), 3)
+
     hor_line_length = euclidean_distance(left_point[0], left_point[1], right_point[0], right_point[1])
     ver_line_length = euclidean_distance(center_top[0], center_top[1], center_bottom[0], center_bottom[1])
 
     return ver_line_length / hor_line_length
 
 
-def process_video(idx_out, vid_filename):
-    if vid_filename:
+@ray.remote
+def process_video(video):
+    global left_processed_videos
 
-        cap = cv2.VideoCapture(vid_filename)
+    fps = get_fps(video)
+    duration = get_duration(video)
 
-        if not cap.isOpened:
-            print('--(!)Error opening video capture-{}: {}'.format(idx_out, vid_filename))
-            return
+    if frames:
+        total_frame = math.ceil(fps * duration)
 
-        print('--(*)Success in opening video capture-{}: {}'.format(idx_out, vid_filename))
-
-        fps = float(cap.get(cv2.CAP_PROP_FPS))
-        total_frame = float(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        curr_frame = 0
         vid_ear_scores = []
         vid_time_labels = []
 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            curr_frame += 1
+        for curr_frame, frame in enumerate(frames):
+            # blinking_ratio_rounded = -1
             blinking_ratio = -1
 
+            print("TEST 1")
             frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = detector(frame_gray)
-
-            print("Curr frame : {}/{}".format(curr_frame, total_frame))
+            print("TEST 2")
 
             if faces:
                 faces_area_max_idx = np.argmax(map(find_face_area, faces))
                 face = faces[faces_area_max_idx]
 
                 landmarks = predictor(frame_gray, face)
-                left_eye_ratio = get_ear([36, 37, 38, 39, 40, 41], landmarks)
-                right_eye_ratio = get_ear([42, 43, 44, 45, 46, 47], landmarks)
+                left_eye_ratio = get_ear(frame, [36, 37, 38, 39, 40, 41], landmarks)
+                right_eye_ratio = get_ear(frame, [42, 43, 44, 45, 46, 47], landmarks)
 
                 blinking_ratio = (left_eye_ratio + right_eye_ratio) / 2
+                # blinking_ratio_rounded = np.round(blinking_ratio * 100) / 100
 
+            print("TEST 3")
             vid_ear_scores.append(blinking_ratio)
-            vid_time_labels.append(curr_frame * 1 / fps)
+            vid_time_labels.append(curr_frame + 1 / total_frame * duration)
 
-            if cv2.waitKey(10) == 27:  # ESC key
-                break
+            # frame = cv2.putText(frame, str(blinking_ratio_rounded), (30, 50),
+            #                     cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 5)
 
-        cap.release()
+        left_processed_videos += 1
         sys.stdout = original_stdout
-        print("Progress: {}/{}".format(-1, total_input_videos))
+        print("Progress: {}/{}".format(left_processed_videos, total_input_videos))
         sys.stdout = file_stdout
 
-        return ({"idx": idx_out, "time_labels": vid_time_labels,
-                 "ear_scores": vid_ear_scores})
+        return {"time_labels": vid_time_labels, "ear_scores": vid_ear_scores}
 
 
 def main():
-    global video_work_queue, total_input_videos, file_stdout, original_stdout, \
-        out_processed_results
+    global total_input_videos, file_stdout, original_stdout
+
+    out_processed_results = []
 
     parser = argparse.ArgumentParser(description='Eye Blinking Detection Rate.')
     parser.add_argument('--model', help='Path to eye detection from face parameter model.',
@@ -169,7 +181,15 @@ def main():
             print("--(!)Video can't be processed at all")
             exit(0)
 
+        # output_vid_filename = output_dir + '/video' + get_split_filename(sample_video)[1][1]
+
+        fps_sample = get_fps(sample_video)
+
+        width_out = int(cap_test.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height_out = int(cap_test.get(cv2.CAP_PROP_FRAME_HEIGHT))
         cap_test.release()
+
+        fourcc = cv2.VideoWriter_fourcc(*'MP4V')
 
         total_input_videos = len(input_videos)
 
@@ -177,13 +197,40 @@ def main():
         print("--(*)Progress: {}/{}".format(0, total_input_videos))
         sys.stdout = file_stdout
 
-        pool = Pool(processes=5)
-        pool_results = pool.starmap(process_video, enumerate(input_videos))
-        out_processed_results = pool_results
+        ray.init(include_dashboard=False)
+
+        workers = []
+        limit_frame = 100
+        for idx, video in enumerate(input_videos):
+            num_frame = 0
+            frames = []
+            cap = cv2.VideoCapture(video)
+            if not cap:
+                print("--(*)Failed in file-{}: {}".format(idx, video))
+                continue
+            print("--(*)Success reading file-{}: {}".format(idx, video))
+            fps = get_fps(video)
+            duration = get_duration(video)
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    # workers.append(process_video.remote(fps, duration, frames))
+                    break
+                num_frame += 1
+                workers.append(process_video.remote(duration, frames, [frame]))
+                if num_frame == limit_frame:
+                    num_frame = 0
+                    frames = []
+
+            cap.release()
+            print("--(*)Frames ready")
+
+        out_processed_results = [ray.get(worker) for worker in workers]
 
         sys.stdout = original_stdout
         print("--(*)Write processed results to: ", output_processed_result)
         sys.stdout = file_stdout
+
         with open(output_processed_result, "w+") as outfile:
             json.dump(out_processed_results, outfile)
 
