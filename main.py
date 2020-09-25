@@ -7,7 +7,7 @@ import argparse
 from pathlib import Path
 from graph import save_ear_graph, save_microsleep_perclos_graph
 import json
-from multiprocessing import Process, Value, Pool
+from multiprocessing import Process, Value, Pool, cpu_count
 
 
 video_work_queue = []
@@ -66,7 +66,7 @@ def process_video(idx_out, vid_filename):
             frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = detector(frame_gray)
 
-            print("Curr frame : {}/{}".format(curr_frame, total_frame))
+            # print("Curr frame : {}/{}".format(curr_frame, total_frame))
 
             if faces:
                 faces_area_max_idx = np.argmax(map(find_face_area, faces))
@@ -86,11 +86,11 @@ def process_video(idx_out, vid_filename):
 
         cap.release()
         sys.stdout = original_stdout
-        print("Progress: {}/{}".format(-1, total_input_videos))
+        print("Assumed Progress: {}/{}".format(idx_out, total_input_videos))
         sys.stdout = file_stdout
 
-        return ({"idx": idx_out, "time_labels": vid_time_labels,
-                 "ear_scores": vid_ear_scores})
+        return ({"idx": idx_out, "video": vid_filename,
+                 "time_labels": vid_time_labels, "ear_scores": vid_ear_scores})
 
 
 def main():
@@ -134,8 +134,16 @@ def main():
             input_processed_result = json.load(json_file)
 
     if not input_processed_result:
-        if not (input_dir_video and Path(input_dir_video).is_dir()):
-            print("--(!)Dir video path is not valid")
+        if not input_dir_video:
+            print("--(!)Dir video path must not be empty !!!")
+            exit(0)
+
+        input_dir_video = Path(input_dir_video)
+        input_dir_video = input_dir_video.expanduser()
+
+        if not input_dir_video.is_dir():
+            print("--(!)Dir video path={} is not valid"
+                  .format(input_dir_video))
             exit(0)
 
         input_videos = get_video_list_in_dir(input_dir_video)
@@ -174,10 +182,11 @@ def main():
         total_input_videos = len(input_videos)
 
         sys.stdout = original_stdout
+        print("--(*)Start multiprocess with cpu_count: {}".format(cpu_count()))
         print("--(*)Progress: {}/{}".format(0, total_input_videos))
         sys.stdout = file_stdout
 
-        pool = Pool(processes=5)
+        pool = Pool(processes=cpu_count())
         pool_results = pool.starmap(process_video, enumerate(input_videos))
         out_processed_results = pool_results
 
@@ -223,20 +232,19 @@ def main():
                     microsleep_time_batch = 0
 
                 if ear_scores[idx] == -1:
-                    previous_ratio = 100
-                    closing_time_batch = 0
-                    microsleep_counter_batch = 0
                     microsleep_time_batch = 0
+                    previous_ratio = 100
                 else:
                     if 0 <= ear_scores[idx] < 0.20:  # close eye
                         if previous_ratio > 0.20:
                             blink_counter = blink_counter + 1
-                        else:
-                            delta_time = time_labels[idx] - (time_labels[idx - 1] if time_labels and idx > 0 else 0)
-                            microsleep_time_batch += delta_time
-                            closing_time_batch += delta_time
+
+                        delta_time = ((time_labels[idx] - time_labels[idx - 1])
+                                      if idx > 0 else time_labels[idx] - total_process_time)
+                        microsleep_time_batch += delta_time
+                        closing_time_batch += delta_time
                     else:  # open eye
-                        if previous_ratio <= 0.20 and 0 < microsleep_time_batch * 1000 < 500:
+                        if 0 <= previous_ratio <= 0.20 and 0 < microsleep_time_batch * 1000 > 500:
                             microsleep_counter_batch += 1
                         microsleep_time_batch = 0
 
@@ -272,7 +280,7 @@ def main():
     save_ear_graph([time_labels_x, ear_ratios], output_ear_graph_filename)
 
     # plot for microsleep and perclos
-    x_labels = np.arange(0, len(microsleep_g) * batch_time, batch_time)
+    x_labels = np.arange(0, len(microsleep_g) * batch_time / 60, batch_time / 60)
     data = [microsleep_g, perclos_g]
     print('\nX_Labels: {}'.format(x_labels))
     save_microsleep_perclos_graph(data, x_labels, output_graph_filename)
